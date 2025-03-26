@@ -1,4 +1,3 @@
-**/__pycache__
-src/secexec/__pycache__
+**/__pycache__/
 venv/
 .venv/
