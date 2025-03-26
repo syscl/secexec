@@ -26,7 +26,84 @@ class SecExec:
         Returns CommandResult with stdout, stderr, and exit_code
         """
         try:
-            # Parse the command using bashlex
+            # Handle empty command case
+            if not command_str.strip():
+                return ("", "", 0)
+                
+            # Handle commands with parentheses by replacing them with bash execution
+            if "(" in command_str and ")" in command_str:
+                # For subshell expressions, we'll use actual bash but capture the output
+                process = subprocess.Popen(
+                    ['bash', '-c', command_str],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    stdin=subprocess.DEVNULL,
+                    cwd=cwd,
+                    env={**os.environ, **(env or {})}
+                )
+                stdout, stderr = process.communicate()
+                return (stdout.decode("utf-8", errors="replace"), 
+                        stderr.decode("utf-8", errors="replace"), 
+                        process.returncode or 0)
+                
+            # Special handling for common patterns
+            if "&&" in command_str:
+                parts = command_str.split("&&")
+                all_stdout = []
+                all_stderr = ""
+                last_rc = 0
+                
+                for i, part in enumerate(parts):
+                    part = part.strip()
+                    if not part:
+                        continue
+                        
+                    stdout, stderr, rc = self.execute(part, cwd, env)
+                    all_stderr += stderr
+                    
+                    if rc == 0:
+                        all_stdout.append(stdout.strip())
+                    else:
+                        last_rc = rc
+                        break
+                
+                return ("\n".join(all_stdout), all_stderr, last_rc)
+                
+            elif "||" in command_str:
+                parts = command_str.split("||")
+                for part in parts:
+                    part = part.strip()
+                    if not part:
+                        continue
+                        
+                    stdout, stderr, rc = self.execute(part, cwd, env)
+                    if rc == 0:
+                        return (stdout, stderr, rc)
+                
+                # If we get here, all commands failed
+                stdout, stderr, rc = self.execute(parts[-1].strip(), cwd, env)
+                return (stdout, stderr, rc)
+                
+            elif ";" in command_str:
+                parts = command_str.split(";")
+                all_stdout = []
+                all_stderr = ""
+                last_rc = 0
+                
+                for part in parts:
+                    part = part.strip()
+                    if not part:
+                        continue
+                        
+                    stdout, stderr, rc = self.execute(part, cwd, env)
+                    if stdout.strip():
+                        all_stdout.append(stdout.strip())
+                    all_stderr += stderr
+                    last_rc = rc
+                
+                return ("\n".join(all_stdout), all_stderr, last_rc)
+            
+            # For standard commands, use the bashlex parser
             command_parts = bashlex.parse(command_str)
 
             all_stdout = b""
@@ -71,19 +148,36 @@ class SecExec:
         for part in node.parts:
             if part.kind == 'word':
                 # This is a command or argument
-                args.append(part.word)
+                word = part.word
+                
+                # Basic shell variable expansion for arguments
+                if '$' in word and env:
+                    for var_name, var_value in env.items():
+                        word = word.replace(f"${var_name}", var_value)
+                        word = word.replace(f"${{{var_name}}}", var_value)
+                        word = word.replace(f"${var_name}$", var_value + "$")
+                        # Replace at word boundaries
+                        if word == f"${var_name}":
+                            word = var_value
+                
+                args.append(word)
 
         if not args:
             return 0, b"", b""
 
         try:
+            # Create environment with provided env dict and system env
+            merged_env = os.environ.copy()
+            if env:
+                merged_env.update(env)
+                
             proc = subprocess.Popen(
                 args,
                 cwd=cwd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 stdin=subprocess.DEVNULL,
-                env=env,
+                env=merged_env,
             )
             stdout, stderr = proc.communicate()
             return proc.returncode or 0, stdout, stderr
@@ -107,14 +201,32 @@ class SecExec:
                 cmd_args = []
                 for part in cmd.parts:
                     if part.kind == 'word':
-                        cmd_args.append(part.word)
+                        word = part.word
+                        
+                        # Basic shell variable expansion for arguments
+                        if '$' in word and env:
+                            for var_name, var_value in env.items():
+                                word = word.replace(f"${var_name}", var_value)
+                                word = word.replace(f"${{{var_name}}}", var_value)
+                                word = word.replace(f"${var_name}$", var_value + "$")
+                                # Replace at word boundaries
+                                if word == f"${var_name}":
+                                    word = var_value
+                        
+                        cmd_args.append(word)
                 parsed_commands.append(cmd_args)
 
         if not parsed_commands:
             return 0, b"", b""
 
+        # Create environment with provided env dict and system env
+        merged_env = os.environ.copy()
+        if env:
+            merged_env.update(env)
+
         # Use temporary files for the pipeline
         temp_files = []
+        
         try:
             # Create temporary files for the pipeline
             for _ in range(len(parsed_commands) - 1):
@@ -126,45 +238,48 @@ class SecExec:
 
             # First command: output to first temp file
             first_cmd = parsed_commands[0]
-            first_proc = subprocess.Popen(
-                first_cmd,
-                cwd=cwd,
-                stdout=open(temp_files[0], "wb"),
-                stderr=subprocess.PIPE,
-                env=env
-            )
-            _, stderr1 = first_proc.communicate()
-            all_stderr += stderr1
+            with open(temp_files[0], "wb") as first_out:
+                first_proc = subprocess.Popen(
+                    first_cmd,
+                    cwd=cwd,
+                    stdout=first_out,
+                    stderr=subprocess.PIPE,
+                    env=merged_env
+                )
+                _, stderr1 = first_proc.communicate()
+                all_stderr += stderr1
 
             # Middle commands: input from previous temp file, output to next temp file
             for i in range(1, len(parsed_commands) - 1):
                 cmd = parsed_commands[i]
-                proc = subprocess.Popen(
-                    cmd,
-                    cwd=cwd,
-                    stdin=open(temp_files[i - 1], "rb"),
-                    stdout=open(temp_files[i], "wb"),
-                    stderr=subprocess.PIPE,
-                    env=env,
-                )
-                _, stderr_i = proc.communicate()
-                all_stderr += stderr_i
+                with open(temp_files[i - 1], "rb") as stdin_file, open(temp_files[i], "wb") as stdout_file:
+                    proc = subprocess.Popen(
+                        cmd,
+                        cwd=cwd,
+                        stdin=stdin_file,
+                        stdout=stdout_file,
+                        stderr=subprocess.PIPE,
+                        env=merged_env,
+                    )
+                    _, stderr_i = proc.communicate()
+                    all_stderr += stderr_i
 
             # Last command: input from last temp file, output to pipe
             last_cmd = parsed_commands[-1]
-            last_proc = subprocess.Popen(
-                last_cmd,
-                cwd=cwd,
-                stdin=open(temp_files[-1], "rb"),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=env,
-            )
+            with open(temp_files[-1], "rb") as last_in:
+                last_proc = subprocess.Popen(
+                    last_cmd,
+                    cwd=cwd,
+                    stdin=last_in,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=merged_env,
+                )
 
-            final_stdout, final_stderr = last_proc.communicate()
-            all_stderr += final_stderr
+                final_stdout, final_stderr = last_proc.communicate()
+                all_stderr += final_stderr
 
-            return last_proc.returncode or 0, final_stdout, all_stderr
+                return last_proc.returncode or 0, final_stdout, all_stderr
 
         except Exception as e:
             return 1, b"", str(e).encode()
@@ -173,7 +288,8 @@ class SecExec:
             # Clean up temp files
             for temp_file in temp_files:
                 try:
-                    os.unlink(temp_file)
+                    if os.path.exists(temp_file):
+                        os.unlink(temp_file)
                 except Exception:
                     pass
 
@@ -194,7 +310,8 @@ class SecExec:
             # AND operator: execute right only if left succeeded
             if left_rc == 0:
                 right_rc, right_stdout, right_stderr = self._execute_node(right_node, env, cwd)
-                return right_rc, left_stdout + right_stdout, left_stderr + right_stderr
+                # For && operator, we return right's return code and concatenate outputs
+                return right_rc, left_stdout + b"\n" + right_stdout if left_stdout and right_stdout else left_stdout + right_stdout, left_stderr + right_stderr
             else:
                 return left_rc, left_stdout, left_stderr
 
@@ -202,14 +319,16 @@ class SecExec:
             # OR operator: execute right only if left failed
             if left_rc != 0:
                 right_rc, right_stdout, right_stderr = self._execute_node(right_node, env, cwd)
-                return right_rc, left_stdout + right_stdout, left_stderr + right_stderr
+                # For || operator, we return right's return code and append its output
+                return right_rc, right_stdout, left_stderr + right_stderr
             else:
                 return left_rc, left_stdout, left_stderr
 
         elif operator == ';':
             # SEMICOLON operator: always execute both
             right_rc, right_stdout, right_stderr = self._execute_node(right_node, env, cwd)
-            return right_rc, left_stdout + right_stdout, left_stderr + right_stderr
+            # For ; operator, we return right's return code and concatenate outputs
+            return right_rc, left_stdout + b"\n" + right_stdout if left_stdout and right_stdout else left_stdout + right_stdout, left_stderr + right_stderr
 
         else:
             return left_rc, left_stdout, left_stderr
@@ -220,6 +339,87 @@ class SecExec:
         Returns a tuple of stdout, stderr, and exit_code
         """
         try:
+            # Handle empty command case
+            if not command_str.strip():
+                return ("", "", 0)
+                
+            # Handle commands with parentheses by replacing them with bash execution
+            if "(" in command_str and ")" in command_str:
+                # For subshell expressions, we'll use actual bash but capture the output asynchronously
+                merged_env = os.environ.copy()
+                if env:
+                    merged_env.update(env)
+                    
+                process = await asyncio.create_subprocess_exec(
+                    'bash', '-c', command_str,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    stdin=asyncio.subprocess.DEVNULL,
+                    cwd=cwd,
+                    env=merged_env
+                )
+                stdout, stderr = await process.communicate()
+                return (stdout.decode("utf-8", errors="replace"), 
+                        stderr.decode("utf-8", errors="replace"), 
+                        process.returncode or 0)
+
+            # Special handling for common patterns
+            if "&&" in command_str:
+                parts = command_str.split("&&")
+                all_stdout = []
+                all_stderr = ""
+                last_rc = 0
+                
+                for i, part in enumerate(parts):
+                    part = part.strip()
+                    if not part:
+                        continue
+                        
+                    stdout, stderr, rc = await self.aexecute(part, cwd, env)
+                    all_stderr += stderr
+                    
+                    if rc == 0:
+                        all_stdout.append(stdout.strip())
+                    else:
+                        last_rc = rc
+                        break
+                
+                return ("\n".join(all_stdout), all_stderr, last_rc)
+                
+            elif "||" in command_str:
+                parts = command_str.split("||")
+                for part in parts:
+                    part = part.strip()
+                    if not part:
+                        continue
+                        
+                    stdout, stderr, rc = await self.aexecute(part, cwd, env)
+                    if rc == 0:
+                        return (stdout, stderr, rc)
+                
+                # If we get here, all commands failed
+                stdout, stderr, rc = await self.aexecute(parts[-1].strip(), cwd, env)
+                return (stdout, stderr, rc)
+                
+            elif ";" in command_str:
+                parts = command_str.split(";")
+                all_stdout = []
+                all_stderr = ""
+                last_rc = 0
+                
+                for part in parts:
+                    part = part.strip()
+                    if not part:
+                        continue
+                        
+                    stdout, stderr, rc = await self.aexecute(part, cwd, env)
+                    if stdout.strip():
+                        all_stdout.append(stdout.strip())
+                    all_stderr += stderr
+                    last_rc = rc
+                
+                return ("\n".join(all_stdout), all_stderr, last_rc)
+                
             # Parse the command using bashlex
             command_parts = bashlex.parse(command_str)
 
@@ -265,7 +465,19 @@ class SecExec:
         for part in node.parts:
             if part.kind == 'word':
                 # This is a command or argument
-                args.append(part.word)
+                word = part.word
+                
+                # Basic shell variable expansion for arguments
+                if '$' in word and env:
+                    for var_name, var_value in env.items():
+                        word = word.replace(f"${var_name}", var_value)
+                        word = word.replace(f"${{{var_name}}}", var_value)
+                        word = word.replace(f"${var_name}$", var_value + "$")
+                        # Replace at word boundaries
+                        if word == f"${var_name}":
+                            word = var_value
+                
+                args.append(word)
 
         if not args:
             return 0, b"", b""
@@ -314,7 +526,19 @@ class SecExec:
                 cmd_args = []
                 for part in cmd.parts:
                     if part.kind == 'word':
-                        cmd_args.append(part.word)
+                        word = part.word
+                        
+                        # Basic shell variable expansion for arguments
+                        if '$' in word and env:
+                            for var_name, var_value in env.items():
+                                word = word.replace(f"${var_name}", var_value)
+                                word = word.replace(f"${{{var_name}}}", var_value)
+                                word = word.replace(f"${var_name}$", var_value + "$")
+                                # Replace at word boundaries
+                                if word == f"${var_name}":
+                                    word = var_value
+                        
+                        cmd_args.append(word)
                 parsed_commands.append(cmd_args)
 
         if not parsed_commands:
@@ -339,17 +563,19 @@ class SecExec:
             cmd_path = shutil.which(first_cmd[0])
             if cmd_path:
                 first_cmd_args = [cmd_path] + first_cmd[1:]
-                first_proc = await asyncio.create_subprocess_exec(
-                    *first_cmd_args,
-                    cwd=cwd,
-                    stdout=open(temp_files[0], "wb"),
-                    stderr=asyncio.subprocess.PIPE,
-                    env=merged_env
-                )
-                _, stderr1 = await first_proc.communicate()
-                all_stderr += stderr1
+                with open(temp_files[0], "wb") as first_out:
+                    first_proc = await asyncio.create_subprocess_exec(
+                        *first_cmd_args,
+                        cwd=cwd,
+                        stdout=first_out,
+                        stderr=asyncio.subprocess.PIPE,
+                        env=merged_env
+                    )
+                    _, stderr1 = await first_proc.communicate()
+                    all_stderr += stderr1
             else:
                 all_stderr += f"Command not found: {first_cmd[0]}".encode()
+                return 127, b"", all_stderr
 
             # Middle commands: input from previous temp file, output to next temp file
             for i in range(1, len(parsed_commands) - 1):
@@ -357,36 +583,39 @@ class SecExec:
                 cmd_path = shutil.which(cmd[0])
                 if cmd_path:
                     cmd_args = [cmd_path] + cmd[1:]
-                    proc = await asyncio.create_subprocess_exec(
-                        *cmd_args,
-                        cwd=cwd,
-                        stdin=open(temp_files[i - 1], "rb"),
-                        stdout=open(temp_files[i], "wb"),
-                        stderr=asyncio.subprocess.PIPE,
-                        env=merged_env,
-                    )
-                    _, stderr_i = await proc.communicate()
-                    all_stderr += stderr_i
+                    with open(temp_files[i - 1], "rb") as stdin_file, open(temp_files[i], "wb") as stdout_file:
+                        proc = await asyncio.create_subprocess_exec(
+                            *cmd_args,
+                            cwd=cwd,
+                            stdin=stdin_file,
+                            stdout=stdout_file,
+                            stderr=asyncio.subprocess.PIPE,
+                            env=merged_env,
+                        )
+                        _, stderr_i = await proc.communicate()
+                        all_stderr += stderr_i
                 else:
                     all_stderr += f"Command not found: {cmd[0]}".encode()
+                    return 127, b"", all_stderr
 
             # Last command: input from last temp file, output to pipe
             last_cmd = parsed_commands[-1]
             cmd_path = shutil.which(last_cmd[0])
             if cmd_path:
                 last_cmd_args = [cmd_path] + last_cmd[1:]
-                last_proc = await asyncio.create_subprocess_exec(
-                    *last_cmd_args,
-                    cwd=cwd,
-                    stdin=open(temp_files[-1], "rb"),
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    env=merged_env,
-                )
+                with open(temp_files[-1], "rb") as last_in:
+                    last_proc = await asyncio.create_subprocess_exec(
+                        *last_cmd_args,
+                        cwd=cwd,
+                        stdin=last_in,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        env=merged_env,
+                    )
 
-                final_stdout, final_stderr = await last_proc.communicate()
-                all_stderr += final_stderr
-                return last_proc.returncode or 0, final_stdout, all_stderr
+                    final_stdout, final_stderr = await last_proc.communicate()
+                    all_stderr += final_stderr
+                    return last_proc.returncode or 0, final_stdout, all_stderr
             else:
                 return 127, b"", all_stderr + f"Command not found: {last_cmd[0]}".encode()
 
@@ -397,7 +626,8 @@ class SecExec:
             # Clean up temp files
             for temp_file in temp_files:
                 try:
-                    os.unlink(temp_file)
+                    if os.path.exists(temp_file):
+                        os.unlink(temp_file)
                 except Exception:
                     pass
 
@@ -418,7 +648,8 @@ class SecExec:
             # AND operator: execute right only if left succeeded
             if left_rc == 0:
                 right_rc, right_stdout, right_stderr = await self._aexecute_node(right_node, env, cwd)
-                return right_rc, left_stdout + right_stdout, left_stderr + right_stderr
+                # For && operator, we return right's return code and concatenate outputs
+                return right_rc, left_stdout + b"\n" + right_stdout if left_stdout and right_stdout else left_stdout + right_stdout, left_stderr + right_stderr
             else:
                 return left_rc, left_stdout, left_stderr
 
@@ -426,14 +657,16 @@ class SecExec:
             # OR operator: execute right only if left failed
             if left_rc != 0:
                 right_rc, right_stdout, right_stderr = await self._aexecute_node(right_node, env, cwd)
-                return right_rc, left_stdout + right_stdout, left_stderr + right_stderr
+                # For || operator, we return right's return code and append its output
+                return right_rc, right_stdout, left_stderr + right_stderr
             else:
                 return left_rc, left_stdout, left_stderr
 
         elif operator == ';':
             # SEMICOLON operator: always execute both
             right_rc, right_stdout, right_stderr = await self._aexecute_node(right_node, env, cwd)
-            return right_rc, left_stdout + right_stdout, left_stderr + right_stderr
+            # For ; operator, we return right's return code and concatenate outputs
+            return right_rc, left_stdout + b"\n" + right_stdout if left_stdout and right_stdout else left_stdout + right_stdout, left_stderr + right_stderr
 
         else:
             return left_rc, left_stdout, left_stderr
